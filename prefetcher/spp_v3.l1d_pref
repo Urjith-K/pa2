@@ -1,0 +1,597 @@
+#include "cache.h"
+
+// ============================================================================
+//  Stride Pattern Prefetcher (SPP) for the L1D
+//
+//  Built on top of the IP-stride prefetcher. For every load IP it keeps:
+//    - a UNIFORM detector:     last stride + confidence counter
+//    - a NON-UNIFORM detector: signature of the last SIG_LENGTH strides, used
+//                              to look up a shared pattern table
+//                              (signature -> next stride + confidence)
+//
+//  On every demand load:
+//    1. compute the stride
+//    2. train both detectors (always, so switching between modes is instant)
+//    3. decide:
+//         uniform confident, and the pattern table does not
+//         confidently predict a different next stride      -> uniform prefetch
+//         else pattern confident                           -> prefetch by chaining pattern predictions
+//         else                                             -> no prefetch
+//
+//  An accuracy checker changes the prefetch degree every ACC_WINDOW prefetches.
+//  A prefetch counts as ISSUED only when it actually brings a block into the
+//  L1D (seen in cache_fill), and as USEFUL when the program later loads that
+//  block. Prefetches for blocks already in the cache, or that only go to L2,
+//  are not counted, so the accuracy reflects what really happened.
+//  No prefetch ever crosses a 4 KB page.
+// ============================================================================
+
+
+// ---------------- IP table ----------------
+#define IP_TRACKER_COUNT 256
+#define MASK_IP 0xFFFF
+
+// ---------------- confidence (same rule for uniform and pattern) ----------------
+#define CONF_MAX 3              // 2-bit saturating counter: 0..3
+#define CONF_THRESHOLD 2        // uniform: prefetch only when confidence >= 2
+#define PATTERN_CONF_THRESHOLD 1 // pattern: IPCP issues CPLX prefetches at confidence >= 1
+#define UNIFORM_MISS_PENALTY 2  // uniform: a different stride costs 2 (lose trust fast, gain it slowly)
+#define PATTERN_MISS_PENALTY 1  // pattern: a different stride costs 1
+
+// ---------------- signature ----------------
+#define SIG_LENGTH 7                                // number of past strides folded into a signature
+#define SIG_BITS 7                                  // 7-bit signature (IPCP-style)
+#define SIG_MASK ((1 << SIG_BITS) - 1)
+#define SIG_WARMUP 2                                // strides seen before the signature is trusted
+
+// ---------------- pattern table ----------------
+#define PT_INDEX_BITS 8
+#define PT_ENTRIES (1 << PT_INDEX_BITS)             // 256 entries
+#define PT_INDEX_MASK (PT_ENTRIES - 1)
+
+// ---------------- accuracy checker / throttling ----------------
+#define PF_FILTER_BITS 8
+#define PF_FILTER_SIZE (1 << PF_FILTER_BITS)        // 256 recently prefetched blocks, direct mapped
+#define ACC_WINDOW 256          // re-check accuracy every 256 prefetches that filled the L1D
+
+// states of an entry in the prefetch filter
+#define PF_INVALID   0          // empty slot
+#define PF_REQUESTED 1          // we sent the prefetch, block has not arrived in L1D yet
+#define PF_FILLED    2          // the prefetch really brought the block into L1D
+#define PF_REQUESTED_L2 3       // we sent the prefetch, but only into L2 (L1D MSHR was busy)
+#define INITIAL_DEGREE 4
+#define MIN_DEGREE 1
+#define MAX_DEGREE 8
+#define ACC_UP   60             // accuracy above 60%  -> degree + 1
+#define ACC_DOWN 40             // accuracy below 40%  -> degree - 1
+                                // in between           -> degree stays the same
+
+
+// ---------------- one row of the IP table ----------------
+class IP_TRACKER {
+  public:
+    // the IP we're tracking
+    uint64_t ip;
+
+    // the last address accessed by this IP
+    uint64_t last_cl_addr;
+
+    // uniform detector: the stride we trust, and how much we trust it
+    int64_t last_stride;
+    uint32_t confidence;
+
+    // non-uniform detector: the last SIG_LENGTH strides packed into one number
+    uint32_t signature;
+
+    // how many strides we have seen so far (stops at SIG_LENGTH);
+    // the signature is only used once it holds SIG_LENGTH real strides
+    uint32_t num_strides;
+
+    // use LRU to evict old IP trackers
+    uint32_t lru;
+
+    IP_TRACKER () {
+        ip = 0;
+        last_cl_addr = 0;
+        last_stride = 0;
+        confidence = 0;
+        signature = 0;
+        num_strides = 0;
+        lru = 0;
+    };
+};
+
+// ---------------- one entry of the pattern table ----------------
+class SPP_PATTERN_ENTRY {
+  public:
+    // upper bits of the signature that owns this entry
+    // (together with the index, this identifies the signature exactly)
+    uint32_t tag;
+
+    // the stride that usually comes after this signature
+    int64_t next_stride;
+
+    // how much we trust next_stride (0..3)
+    uint32_t confidence;
+
+    SPP_PATTERN_ENTRY () {
+        tag = 0;
+        next_stride = 0;
+        confidence = 0;
+    };
+};
+
+IP_TRACKER trackers[IP_TRACKER_COUNT];
+SPP_PATTERN_ENTRY spp_pattern_table[PT_ENTRIES];
+
+// accuracy checker: recently prefetched blocks and their state, indexed by the low block bits
+uint64_t spp_pf_filter[PF_FILTER_SIZE];
+uint32_t spp_pf_filter_state[PF_FILTER_SIZE];
+
+// accuracy checker: counters for the current window
+uint32_t spp_window_issued = 0;
+uint32_t spp_window_useful = 0;
+
+// prefetch degree, changed at run time by the accuracy checker
+uint32_t spp_degree = INITIAL_DEGREE;
+
+// statistics printed at the end
+uint64_t spp_stat_requested = 0;   // prefetch requests sent to the prefetch queue
+uint64_t spp_stat_issued = 0;      // prefetches that really filled a block into L1D
+uint64_t spp_stat_useful = 0;
+uint64_t spp_stat_uniform_pf = 0;
+uint64_t spp_stat_pattern_pf = 0;
+uint64_t spp_stat_degree_windows[MAX_DEGREE + 1];
+
+// diagnostic statistics: where prefetches went, and why loads were or were not covered
+uint64_t spp_stat_sent_l1 = 0;        // sent with FILL_L1
+uint64_t spp_stat_sent_l2 = 0;        // sent with FILL_L2 only (L1D MSHR at least half full)
+uint64_t spp_stat_pq_full = 0;        // prefetch_line refused (L1D prefetch queue full)
+uint64_t spp_stat_dedup = 0;          // skipped: block already in the prefetch filter
+uint64_t spp_stat_late = 0;           // demand load arrived while our prefetch was still in flight
+uint64_t spp_stat_loads = 0;          // demand loads seen
+uint64_t spp_stat_load_misses = 0;    // demand loads that missed in L1D
+uint64_t spp_stat_new_ip = 0;         // loads that allocated a new IP row (no prediction possible)
+uint64_t spp_stat_mode_uniform = 0;   // loads handled in uniform mode
+uint64_t spp_stat_mode_pattern = 0;   // loads handled in pattern mode
+uint64_t spp_stat_mode_none = 0;      // loads with a known IP but no confident prediction
+uint64_t spp_stat_miss_none = 0;      // L1D misses among the mode_none loads
+uint64_t spp_stat_pt_override = 0;    // uniform was confident but the pattern table overrode it
+uint64_t spp_stat_miss_l2_only = 0;   // demand load missed L1D on a block we had prefetched into L2 only
+uint64_t spp_stat_page_stop = 0;      // prefetch loop stopped at the 4 KB page boundary
+uint64_t spp_stat_same_block = 0;     // loads to the same block as the IP's previous load (stride 0)
+
+// statistics only count the measured part of the run: warmup runs with
+// unrealistically fast memory, so its numbers would be misleading
+uint32_t spp_stats_reset_done = 0;
+
+
+// ============================================================================
+//  helper functions
+// ============================================================================
+
+// shared confidence rule, used by both detectors:
+//   same stride        -> confidence +1 (max CONF_MAX)
+//   different stride   -> confidence -penalty (min 0)
+//   confidence hits 0  -> replace the stored stride with the new one, confidence 1
+void spp_train(int64_t &stored_stride, uint32_t &conf, int64_t new_stride, uint32_t penalty)
+{
+    if (new_stride == stored_stride) {
+        if (conf < CONF_MAX)
+            conf++;
+    }
+    else {
+        if (conf > penalty)
+            conf -= penalty;
+        else
+            conf = 0;
+
+        if (conf == 0) {
+            stored_stride = new_stride;
+            conf = 1;
+        }
+    }
+}
+
+// fold a new stride into the signature by shifting a SINGLE bit and XOR-ing
+// the whole stride in. Shifting by one bit lets a 7-bit signature carry the
+// last 7 strides, and XOR-ing the full stride avoids the aliasing of a
+// truncated stride field (where 0, 16, 32 and 48 all looked identical).
+uint32_t spp_update_signature(uint32_t sig, int64_t stride)
+{
+    return ((sig << 1) ^ ((uint32_t)stride)) & SIG_MASK;
+}
+
+// which pattern table entry a signature uses, and the tag stored there
+uint32_t spp_pt_index(uint32_t sig) { return (sig ^ (sig >> PT_INDEX_BITS)) & PT_INDEX_MASK; }
+uint32_t spp_pt_tag(uint32_t sig)   { return (sig >> PT_INDEX_BITS); }
+
+// teach the pattern table: "after signature sig, the stride new_stride came"
+void spp_train_pattern(uint32_t sig, int64_t new_stride)
+{
+    SPP_PATTERN_ENTRY &entry = spp_pattern_table[spp_pt_index(sig)];
+    uint32_t tag = spp_pt_tag(sig);
+
+    if (entry.tag == tag) {
+        // this entry belongs to our signature: normal confidence update
+        spp_train(entry.next_stride, entry.confidence, new_stride, PATTERN_MISS_PENALTY);
+    }
+    else {
+        // the entry belongs to another signature: weaken it,
+        // and take it over only once its confidence reaches 0
+        if (entry.confidence > 0)
+            entry.confidence--;
+
+        if (entry.confidence == 0) {
+            entry.tag = tag;
+            entry.next_stride = new_stride;
+            entry.confidence = 1;
+        }
+    }
+}
+
+// ask the pattern table what comes after signature sig;
+// returns true (and the stride) only if the entry is ours and confident
+bool spp_predict(uint32_t sig, int64_t &stride)
+{
+    SPP_PATTERN_ENTRY &entry = spp_pattern_table[spp_pt_index(sig)];
+
+    if (entry.tag == spp_pt_tag(sig) && entry.confidence >= PATTERN_CONF_THRESHOLD) {
+        stride = entry.next_stride;
+        return true;
+    }
+    return false;
+}
+
+// find a block in the prefetch filter; returns its slot, or -1 if it is not there
+int spp_find_pf_filter(uint64_t cl_addr)
+{
+    int slot = cl_addr & (PF_FILTER_SIZE - 1);
+    if (spp_pf_filter_state[slot] != PF_INVALID && spp_pf_filter[slot] == cl_addr)
+        return slot;
+    return -1;
+}
+
+// put a block in its filter slot with the given state (replaces whatever was there)
+void spp_add_pf_filter(uint64_t cl_addr, uint32_t state)
+{
+    int slot = cl_addr & (PF_FILTER_SIZE - 1);
+    spp_pf_filter[slot] = cl_addr;
+    spp_pf_filter_state[slot] = state;
+}
+
+// clear the statistics once, when warmup ends
+void spp_reset_stats()
+{
+    spp_stat_requested = 0;
+    spp_stat_issued = 0;
+    spp_stat_useful = 0;
+    spp_stat_uniform_pf = 0;
+    spp_stat_pattern_pf = 0;
+    for (int i=0; i<=MAX_DEGREE; i++)
+        spp_stat_degree_windows[i] = 0;
+    spp_stat_sent_l1 = 0;
+    spp_stat_sent_l2 = 0;
+    spp_stat_pq_full = 0;
+    spp_stat_dedup = 0;
+    spp_stat_late = 0;
+    spp_stat_loads = 0;
+    spp_stat_load_misses = 0;
+    spp_stat_new_ip = 0;
+    spp_stat_mode_uniform = 0;
+    spp_stat_mode_pattern = 0;
+    spp_stat_mode_none = 0;
+    spp_stat_miss_none = 0;
+    spp_stat_pt_override = 0;
+    spp_stat_miss_l2_only = 0;
+    spp_stat_page_stop = 0;
+    spp_stat_same_block = 0;
+    spp_stats_reset_done = 1;
+}
+
+// every ACC_WINDOW issued prefetches: compute accuracy and step the degree up or down
+void spp_update_degree()
+{
+    if (spp_window_issued < ACC_WINDOW)
+        return;
+
+    uint32_t accuracy = (spp_window_useful * 100) / spp_window_issued;
+
+    // step the degree up or down by 1, staying between MIN_DEGREE and MAX_DEGREE
+    if (accuracy > ACC_UP && spp_degree < MAX_DEGREE)
+        spp_degree++;
+    else if (accuracy < ACC_DOWN && spp_degree > MIN_DEGREE)
+        spp_degree--;
+
+    spp_stat_degree_windows[spp_degree]++;
+
+    // start a new window
+    spp_window_issued = 0;
+    spp_window_useful = 0;
+}
+
+// send one prefetch for block pf_cl_addr; returns 1 if it was sent
+int spp_issue(CACHE *cache, uint64_t ip, uint64_t addr, uint64_t pf_cl_addr)
+{
+    // already prefetched recently -> don't send it again
+    if (spp_find_pf_filter(pf_cl_addr) != -1) {
+        spp_stat_dedup++;
+        return 0;
+    }
+
+    uint64_t pf_address = pf_cl_addr << LOG2_BLOCK_SIZE;
+    int sent;
+
+    // same MSHR rule as IP-stride: L1 if there is room, otherwise only L2
+    bool to_l1 = (cache->MSHR.occupancy < (cache->MSHR.SIZE>>1));
+    if (to_l1)
+        sent = cache->prefetch_line(ip, addr, pf_address, FILL_L1, 0);
+    else
+        sent = cache->prefetch_line(ip, addr, pf_address, FILL_L2, 0);
+
+    // remember it as REQUESTED; it is only counted as issued
+    // once it really arrives in the L1D (see cache_fill)
+    if (sent) {
+        spp_add_pf_filter(pf_cl_addr, to_l1 ? PF_REQUESTED : PF_REQUESTED_L2);
+        spp_stat_requested++;
+        if (to_l1)
+            spp_stat_sent_l1++;
+        else
+            spp_stat_sent_l2++;
+    }
+    else
+        spp_stat_pq_full++;
+    return sent;
+}
+
+
+// ============================================================================
+//  ChampSim hooks
+// ============================================================================
+
+void CACHE::l1d_prefetcher_initialize()
+{
+    std::cout << "------------------------------------------------" << std::endl;
+    std::cout << "        Stride Pattern Prefetcher (SPP)         " << std::endl;
+    std::cout << "------------------------------------------------" << std::endl;
+
+    for (int i=0; i<IP_TRACKER_COUNT; i++)
+        trackers[i].lru = i;
+
+    for (int i=0; i<PF_FILTER_SIZE; i++)
+        spp_pf_filter_state[i] = PF_INVALID;
+
+    for (int i=0; i<=MAX_DEGREE; i++)
+        spp_stat_degree_windows[i] = 0;
+}
+
+void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint8_t critical_ip_flag)
+{
+    // only learn from demand loads
+    if (type != LOAD)
+        return;
+
+    // warmup just ended -> start the statistics from zero
+    if (warmup_complete[cpu] && !spp_stats_reset_done)
+        spp_reset_stats();
+
+    uint64_t cl_addr = addr >> LOG2_BLOCK_SIZE;
+
+    // ---------- accuracy checker ----------
+    // the program is loading this block: if one of our prefetches brought it
+    // into the L1D, that prefetch was useful. Either way the entry is done.
+    spp_stat_loads++;
+    if (!cache_hit)
+        spp_stat_load_misses++;
+
+    int slot = spp_find_pf_filter(cl_addr);
+    if (slot != -1) {
+        if (spp_pf_filter_state[slot] == PF_FILLED) {
+            spp_window_useful++;
+            spp_stat_useful++;
+        }
+        else if (!cache_hit && spp_pf_filter_state[slot] == PF_REQUESTED)
+            spp_stat_late++;
+        else if (!cache_hit && spp_pf_filter_state[slot] == PF_REQUESTED_L2)
+            spp_stat_miss_l2_only++;
+        spp_pf_filter_state[slot] = PF_INVALID;
+    }
+    spp_update_degree();
+
+    // ---------- find this IP's row (same as IP-stride) ----------
+    uint64_t ip_tag = ip & MASK_IP;
+
+    int index = -1;
+    for (index=0; index<IP_TRACKER_COUNT; index++) {
+        if (trackers[index].ip == ip_tag)
+            break;
+    }
+
+    // this is a new IP that doesn't have a tracker yet, so allocate one
+    if (index == IP_TRACKER_COUNT) {
+
+        for (index=0; index<IP_TRACKER_COUNT; index++) {
+            if (trackers[index].lru == (IP_TRACKER_COUNT-1))
+                break;
+        }
+
+        trackers[index].ip = ip_tag;
+        trackers[index].last_cl_addr = cl_addr;
+        trackers[index].last_stride = 0;
+        trackers[index].confidence = 0;     // new IP: no trust yet
+        trackers[index].signature = 0;      // new IP: no stride history yet
+        trackers[index].num_strides = 0;
+
+        for (int i=0; i<IP_TRACKER_COUNT; i++) {
+            if (trackers[i].lru < trackers[index].lru)
+                trackers[i].lru++;
+        }
+        trackers[index].lru = 0;
+
+        spp_stat_new_ip++;
+        return;
+    }
+
+    // sanity check
+    // at this point we should know a matching tracker index
+    if (index == -1)
+        assert(0);
+
+    // mark this IP as most recently used now, before any early return,
+    // so IPs that keep loading the same block are not evicted first
+    for (int i=0; i<IP_TRACKER_COUNT; i++) {
+        if (trackers[i].lru < trackers[index].lru)
+            trackers[i].lru++;
+    }
+    trackers[index].lru = 0;
+
+    // ---------- compute the stride (same as IP-stride) ----------
+    int64_t stride = 0;
+    if (cl_addr > trackers[index].last_cl_addr)
+        stride = cl_addr - trackers[index].last_cl_addr;
+    else {
+        stride = trackers[index].last_cl_addr - cl_addr;
+        stride *= -1;
+    }
+
+    // don't do anything if we somehow saw the same address twice in a row
+    if (stride == 0) {
+        spp_stat_same_block++;
+        return;
+    }
+
+    // ---------- 1) train the uniform detector ----------
+    spp_train(trackers[index].last_stride, trackers[index].confidence, stride, UNIFORM_MISS_PENALTY);
+
+    // ---------- 2) train the non-uniform detector ----------
+    // "after the last SIG_LENGTH strides, this stride came"
+    if (trackers[index].num_strides >= SIG_WARMUP)
+        spp_train_pattern(trackers[index].signature, stride);
+
+    // slide this stride into the signature
+    trackers[index].signature = spp_update_signature(trackers[index].signature, stride);
+    if (trackers[index].num_strides < SIG_LENGTH)
+        trackers[index].num_strides++;
+
+    // ---------- 3) decide and prefetch ----------
+    // a uniform run inside a repeating pattern (the +2,+2,+2 of +1,+2,+2,+2,+3)
+    // looks confident, but the pattern table knows the next stride is different
+    int64_t pt_stride = 0;
+    bool pt_confident = (trackers[index].num_strides >= SIG_WARMUP) && spp_predict(trackers[index].signature, pt_stride);
+    bool pt_disagrees = pt_confident && (pt_stride != trackers[index].last_stride);
+
+    if (trackers[index].confidence >= CONF_THRESHOLD && pt_disagrees)
+        spp_stat_pt_override++;
+
+    if (trackers[index].confidence >= CONF_THRESHOLD && !pt_disagrees) {
+
+        spp_stat_mode_uniform++;
+
+        // UNIFORM: prefetch cl + s, cl + 2s, ... cl + degree*s
+        for (uint32_t i=0; i<spp_degree; i++) {
+            uint64_t pf_cl_addr = cl_addr + (trackers[index].last_stride * (i+1));
+            uint64_t pf_address = pf_cl_addr << LOG2_BLOCK_SIZE;
+
+            // only prefetch inside the same 4 KB page
+            if ((pf_address >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE)) {
+                spp_stat_page_stop++;
+                break;
+            }
+
+            if (spp_issue(this, ip, addr, pf_cl_addr))
+                spp_stat_uniform_pf++;
+        }
+    }
+    else if (pt_confident) {
+
+        // NON-UNIFORM: chain predictions from the pattern table.
+        // each predicted stride is fed into a temporary signature
+        // to predict the stride after it
+        spp_stat_mode_pattern++;
+
+        uint32_t spec_signature = trackers[index].signature;
+        uint64_t pf_cl_addr = cl_addr;
+
+        for (uint32_t i=0; i<spp_degree; i++) {
+            // Look the signature up directly instead of going through
+            // spp_predict, so that a low-confidence link does not kill the
+            // whole chain. IPCP keeps walking: the stored stride still
+            // advances the signature, it just does not issue a prefetch.
+            SPP_PATTERN_ENTRY &e = spp_pattern_table[spp_pt_index(spec_signature)];
+            bool conf_ok = (e.tag == spp_pt_tag(spec_signature)) &&
+                           (e.confidence >= PATTERN_CONF_THRESHOLD);
+            int64_t next_stride = e.next_stride;
+
+            // a zero stride carries no information and would loop forever
+            if (next_stride == 0)
+                break;
+
+            pf_cl_addr = pf_cl_addr + next_stride;
+            uint64_t pf_address = pf_cl_addr << LOG2_BLOCK_SIZE;
+
+            // only prefetch inside the same 4 KB page
+            if ((pf_address >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE)) {
+                spp_stat_page_stop++;
+                break;
+            }
+
+            if (conf_ok && spp_issue(this, ip, addr, pf_cl_addr))
+                spp_stat_pattern_pf++;
+
+            spec_signature = spp_update_signature(spec_signature, next_stride);
+        }
+    }
+    else {
+        spp_stat_mode_none++;
+        if (!cache_hit)
+            spp_stat_miss_none++;
+    }
+
+    // ---------- update the row (same as IP-stride) ----------
+    trackers[index].last_cl_addr = cl_addr;
+    return;
+}
+
+void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t v_evicted_addr, uint64_t evicted_addr, uint32_t metadata_in)
+{
+    // only blocks brought in by our prefetches matter for the accuracy checker
+    if (!prefetch)
+        return;
+
+    // v_addr is the virtual address, the same kind of address operate() sees
+    uint64_t cl_addr = v_addr >> LOG2_BLOCK_SIZE;
+
+    // this prefetch really brought a block into the L1D -> count it as issued
+    spp_add_pf_filter(cl_addr, PF_FILLED);
+
+    spp_window_issued++;
+    spp_stat_issued++;
+
+    return;
+}
+
+void CACHE::l1d_prefetcher_final_stats()
+{
+    std::cout << "SPP final stats" << std::endl;
+    std::cout << "SPP prefetch requests sent: " << spp_stat_requested << std::endl;
+    std::cout << "SPP prefetches filled into L1D (issued): " << spp_stat_issued << std::endl;
+    std::cout << "SPP useful prefetches (own checker): " << spp_stat_useful << std::endl;
+    if (spp_stat_issued > 0)
+        std::cout << "SPP accuracy (own checker): " << (100.0 * spp_stat_useful / spp_stat_issued) << "%" << std::endl;
+    std::cout << "SPP uniform-mode prefetches: " << spp_stat_uniform_pf << std::endl;
+    std::cout << "SPP pattern-mode prefetches: " << spp_stat_pattern_pf << std::endl;
+    std::cout << "SPP windows spent at each degree:";
+    for (int i=1; i<=MAX_DEGREE; i++)
+        std::cout << "  d" << i << "=" << spp_stat_degree_windows[i];
+    std::cout << std::endl;
+
+    std::cout << "SPP DIAG sent_L1: " << spp_stat_sent_l1 << "  sent_L2_only: " << spp_stat_sent_l2
+              << "  pq_full: " << spp_stat_pq_full << "  dedup: " << spp_stat_dedup
+              << "  page_stops: " << spp_stat_page_stop << std::endl;
+    std::cout << "SPP DIAG loads: " << spp_stat_loads << "  load_misses: " << spp_stat_load_misses
+              << "  late: " << spp_stat_late << "  missed_but_in_L2_only: " << spp_stat_miss_l2_only << std::endl;
+    std::cout << "SPP DIAG modes  new_ip: " << spp_stat_new_ip << "  same_block: " << spp_stat_same_block
+              << "  uniform: " << spp_stat_mode_uniform << "  pattern: " << spp_stat_mode_pattern
+              << "  none: " << spp_stat_mode_none << "  none_misses: " << spp_stat_miss_none
+              << "  pt_override: " << spp_stat_pt_override << std::endl;
+}

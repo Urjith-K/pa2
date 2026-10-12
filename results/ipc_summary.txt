@@ -1,0 +1,6 @@
+results/baseline_trace1.txt:CPU 0 cumulative IPC: 0.232345 instructions: 25000000 cycles: 107598652
+results/baseline_trace2.txt:CPU 0 cumulative IPC: 0.251158 instructions: 25000001 cycles: 99538958
+results/baseline_trace3.txt:CPU 0 cumulative IPC: 0.382065 instructions: 25000001 cycles: 65433974
+results/ipstride_trace1.txt:CPU 0 cumulative IPC: 0.233452 instructions: 25000000 cycles: 107088310
+results/ipstride_trace2.txt:CPU 0 cumulative IPC: 0.25126 instructions: 25000001 cycles: 99498688
+results/ipstride_trace3.txt:CPU 0 cumulative IPC: 0.382862 instructions: 25000001 cycles: 65297638

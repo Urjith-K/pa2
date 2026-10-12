@@ -1,0 +1,48 @@
+results/baseline_trace1.txt:CPU 0 cumulative IPC: 0.232345 instructions: 25000000 cycles: 107598652
+results/baseline_trace2.txt:CPU 0 cumulative IPC: 0.251158 instructions: 25000001 cycles: 99538958
+results/baseline_trace3.txt:CPU 0 cumulative IPC: 0.382065 instructions: 25000001 cycles: 65433974
+results/ipstride_trace1.txt:CPU 0 cumulative IPC: 0.233452 instructions: 25000000 cycles: 107088310
+results/ipstride_trace2.txt:CPU 0 cumulative IPC: 0.25126 instructions: 25000001 cycles: 99498688
+results/ipstride_trace3.txt:CPU 0 cumulative IPC: 0.382862 instructions: 25000001 cycles: 65297638
+results/spp_trace1.txt:CPU 0 cumulative IPC: 0.233577 instructions: 25000000 cycles: 107031161
+results/spp_trace2.txt:CPU 0 cumulative IPC: 0.251275 instructions: 25000001 cycles: 99492520
+results/spp_trace3.txt:CPU 0 cumulative IPC: 0.383526 instructions: 25000001 cycles: 65184656
+results/spp2_trace1.txt:CPU 0 cumulative IPC: 0.233574 instructions: 25000000 cycles: 107032468
+results/spp2_trace2.txt:CPU 0 cumulative IPC: 0.251331 instructions: 25000001 cycles: 99470455
+results/spp2_trace3.txt:CPU 0 cumulative IPC: 0.382927 instructions: 25000001 cycles: 65286537
+results/spp_trace1.txt:L1D LOAD      ACCESS:    4287114  HIT:    4039615  MISS:     247499  HIT %:    94.2269  MISS %:    5.77309   MPKI: 9.89996
+results/spp_trace1.txt:L1D USEFUL LOAD PREFETCHES:      22596 PREFETCH ISSUED TO LOWER LEVEL:      41548  ACCURACY: 54.3853
+results/spp_trace2.txt:L1D LOAD      ACCESS:    4317742  HIT:    3982085  MISS:     335657  HIT %:    92.2261  MISS %:     7.7739   MPKI: 13.4263
+results/spp_trace2.txt:L1D USEFUL LOAD PREFETCHES:       5186 PREFETCH ISSUED TO LOWER LEVEL:      15022  ACCURACY: 34.5227
+results/spp_trace3.txt:L1D LOAD      ACCESS:    5094138  HIT:    5013088  MISS:      81050  HIT %:     98.409  MISS %:    1.59104   MPKI: 3.242
+results/spp_trace3.txt:L1D USEFUL LOAD PREFETCHES:       4856 PREFETCH ISSUED TO LOWER LEVEL:      24296  ACCURACY: 19.9868
+results/spp2_trace1.txt:L1D LOAD      ACCESS:    4286951  HIT:    4039252  MISS:     247699  HIT %:     94.222  MISS %:    5.77798   MPKI: 9.90796
+results/spp2_trace1.txt:L1D USEFUL LOAD PREFETCHES:      22234 PREFETCH ISSUED TO LOWER LEVEL:      40356  ACCURACY: 55.0947
+results/spp2_trace2.txt:L1D LOAD      ACCESS:    4317015  HIT:    3980711  MISS:     336304  HIT %:    92.2098  MISS %:     7.7902   MPKI: 13.4522
+results/spp2_trace2.txt:L1D USEFUL LOAD PREFETCHES:       3054 PREFETCH ISSUED TO LOWER LEVEL:       6350  ACCURACY: 48.0945
+results/spp2_trace3.txt:L1D LOAD      ACCESS:    5093131  HIT:    5009909  MISS:      83222  HIT %:     98.366  MISS %:      1.634   MPKI: 3.32888
+results/spp2_trace3.txt:L1D USEFUL LOAD PREFETCHES:       2139 PREFETCH ISSUED TO LOWER LEVEL:       9880  ACCURACY: 21.6498
+results/spp2_trace1.txt:SPP final stats
+results/spp2_trace1.txt:SPP prefetch requests sent: 91445
+results/spp2_trace1.txt:SPP prefetches filled into L1D (issued): 34248
+results/spp2_trace1.txt:SPP useful prefetches (own checker): 21352
+results/spp2_trace1.txt:SPP accuracy (own checker): 62.3452%
+results/spp2_trace1.txt:SPP uniform-mode prefetches: 66347
+results/spp2_trace1.txt:SPP pattern-mode prefetches: 25098
+results/spp2_trace1.txt:SPP windows spent at each degree:  d1=0  d2=1  d3=24  d4=108
+results/spp2_trace2.txt:SPP final stats
+results/spp2_trace2.txt:SPP prefetch requests sent: 25547
+results/spp2_trace2.txt:SPP prefetches filled into L1D (issued): 5678
+results/spp2_trace2.txt:SPP useful prefetches (own checker): 2887
+results/spp2_trace2.txt:SPP accuracy (own checker): 50.8454%
+results/spp2_trace2.txt:SPP uniform-mode prefetches: 21086
+results/spp2_trace2.txt:SPP pattern-mode prefetches: 4461
+results/spp2_trace2.txt:SPP windows spent at each degree:  d1=11  d2=2  d3=2  d4=7
+results/spp2_trace3.txt:SPP final stats
+results/spp2_trace3.txt:SPP prefetch requests sent: 82121
+results/spp2_trace3.txt:SPP prefetches filled into L1D (issued): 6755
+results/spp2_trace3.txt:SPP useful prefetches (own checker): 2059
+results/spp2_trace3.txt:SPP accuracy (own checker): 30.4811%
+results/spp2_trace3.txt:SPP uniform-mode prefetches: 29507
+results/spp2_trace3.txt:SPP pattern-mode prefetches: 52614
+results/spp2_trace3.txt:SPP windows spent at each degree:  d1=19  d2=6  d3=2  d4=0

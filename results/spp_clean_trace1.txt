@@ -1,0 +1,25 @@
+
+*** ChampSim Multicore Out-of-Order Simulator ***
+
+Warmup Instructions: 25000000
+Simulation Instructions: 25000000
+Number of CPUs: 1
+LLC sets: 2048
+LLC ways: 16
+Off-chip DRAM Size: 4096 MB Channels: 1 Width: 64-bit Data Rate: 6400 MT/s
+CPU 0 runs ../traces/trace1.gz
+.gz
+BTB has LRU replacement policy
+ITLB has LRU replacement policy
+DTLB has LRU replacement policy
+STLB has LRU replacement policy
+L1I has LRU replacement policy
+CPU 0 L1D Stride Pattern Prefetcher (SPP)
+L1D has LRU replacement policy
+L2C has LRU replacement policy
+LLC has LRU replacement policy
+Heartbeat CPU 0 instructions: 10000002 cycles: 2952509 heartbeat IPC: 3.38695 cumulative IPC: 3.38695 (Simulation time: 0 hr 0 min 30 sec) 
+Heartbeat CPU 0 instructions: 20000001 cycles: 5913342 heartbeat IPC: 3.37743 cumulative IPC: 3.38218 (Simulation time: 0 hr 1 min 4 sec) 
+
+Warmup complete CPU 0 instructions: 25000004 cycles: 7347529 (Simulation time: 0 hr 1 min 16 sec) 
+
