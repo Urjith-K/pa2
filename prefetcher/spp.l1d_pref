@@ -34,7 +34,7 @@
 // ---------------- confidence (same rule for uniform and pattern) ----------------
 #define CONF_MAX 3              // 2-bit saturating counter: 0..3
 #define CONF_THRESHOLD 2        // prefetch only when confidence >= 2
-#define UNIFORM_MISS_PENALTY 2  // uniform: a different stride costs 2 (lose trust fast, gain it slowly)
+#define UNIFORM_MISS_PENALTY 1  // uniform: a different stride costs 1, so one odd stride does not wipe out a trained stride
 #define PATTERN_MISS_PENALTY 1  // pattern: a different stride costs 1
 
 // ---------------- signature ----------------
@@ -45,7 +45,7 @@
 #define SIG_STRIDE_MASK ((1 << SIG_STRIDE_BITS) - 1)
 
 // ---------------- pattern table ----------------
-#define PT_INDEX_BITS 8
+#define PT_INDEX_BITS 12
 #define PT_ENTRIES (1 << PT_INDEX_BITS)
 #define PT_INDEX_MASK (PT_ENTRIES - 1)
 
@@ -62,7 +62,7 @@
 
 #define INITIAL_DEGREE 4
 #define MIN_DEGREE 1
-#define MAX_DEGREE 8
+#define MAX_DEGREE 32
 #define ACC_UP   60             // accuracy above 60%  -> degree + 1
 #define ACC_DOWN 40             // accuracy below 40%  -> degree - 1
                                 // in between          -> degree stays the same
