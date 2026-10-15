@@ -1,35 +1,26 @@
 #include "cache.h"
 
-// ============================================================================
-//  Stride Pattern Prefetcher (SPP) for the L1D
-//
-//  Built on top of the IP-stride prefetcher. For every load IP it keeps:
-//    - a UNIFORM detector:     last stride + confidence counter
-//    - a NON-UNIFORM detector: signature of the last SIG_LENGTH strides, used
-//                              to look up a shared pattern table
-//                              (signature -> next stride + confidence)
-//
-//  On every demand load:
-//    1. compute the stride
-//    2. train both detectors (always, so switching between modes is instant)
-//    3. decide:
-//         uniform confident, and the pattern table does not
-//         confidently predict a different next stride  -> uniform prefetch
-//         else pattern confident                       -> chain pattern predictions
-//         else                                         -> no prefetch
-//
-//  An accuracy checker changes the prefetch degree every ACC_WINDOW prefetches.
-//  A prefetch counts as ISSUED only when it actually brings a block into the
-//  L1D (seen in cache_fill), and as USEFUL when the program later loads that
-//  block. Prefetches for blocks already in the cache, or that only go to L2,
-//  are not counted, so the accuracy reflects what really happened.
-//  No prefetch ever crosses a 4 KB page.
-// ============================================================================
-
-
 // ---------------- IP table ----------------
-#define IP_TRACKER_COUNT 256
-#define MASK_IP 0xFFFF
+// 8-way set-associative: an IP is looked up only in the 8 rows of its set,
+// which is buildable at the L1D, unlike a 512-entry fully associative search.
+// Measured: 8-way loses nothing against fully associative (REPORT.md).
+#define IP_TRACKER_COUNT 512
+#define IP_WAYS 8                                   // associativity (IP_TRACKER_COUNT = fully associative)
+#define IP_SETS (IP_TRACKER_COUNT / IP_WAYS)        // 64 sets
+#define IP_TAG_BITS 16
+#define MASK_IP ((1 << IP_TAG_BITS) - 1)
+
+// only the low LAST_ADDR_BITS of the last block are kept; the stride is
+// computed modulo 2^LAST_ADDR_BITS, which is exact for any jump smaller than
+// 32K blocks (2 MB)
+#define LAST_ADDR_BITS 16
+#define LAST_ADDR_MASK ((1ULL << LAST_ADDR_BITS) - 1)
+
+// strides are stored in 7 bits (-64..63). A stride of a whole page (64
+// blocks) or more can never produce a prefetch inside the page, so every such
+// stride is stored as one value, STRIDE_FAR.
+#define STRIDE_MAX 63
+#define STRIDE_FAR (-64)
 
 // ---------------- confidence (same rule for uniform and pattern) ----------------
 #define CONF_MAX 3              // 2-bit saturating counter: 0..3
@@ -39,20 +30,22 @@
 
 // ---------------- signature ----------------
 #define SIG_LENGTH 3                                // number of past strides in a signature
-#define SIG_STRIDE_BITS 4                           // bits kept from each stride
-#define SIG_BITS (SIG_LENGTH * SIG_STRIDE_BITS)     // 12-bit signature
+#define SIG_STRIDE_BITS 5                           // bits kept from each stride
+#define SIG_BITS (SIG_LENGTH * SIG_STRIDE_BITS)     // 15-bit signature
 #define SIG_MASK ((1 << SIG_BITS) - 1)
 #define SIG_STRIDE_MASK ((1 << SIG_STRIDE_BITS) - 1)
 
 // ---------------- pattern table ----------------
-#define PT_INDEX_BITS 12
-#define PT_ENTRIES (1 << PT_INDEX_BITS)
+#define PT_INDEX_BITS 8
+#define PT_ENTRIES (1 << PT_INDEX_BITS)             // 256 entries, 7-bit tag
 #define PT_INDEX_MASK (PT_ENTRIES - 1)
 
 // ---------------- accuracy checker / throttling ----------------
 #define PF_FILTER_BITS 8
 #define PF_FILTER_SIZE (1 << PF_FILTER_BITS)        // recently prefetched blocks, direct mapped
-#define ACC_WINDOW 256          // re-check accuracy every 256 prefetches that filled the L1D
+#define PF_TAG_BITS 12                              // block bits kept above the index
+#define PF_TAG_MASK ((1ULL << PF_TAG_BITS) - 1)
+#define ACC_WINDOW 32           // re-check accuracy every 32 prefetches that filled the L1D
 
 // states of an entry in the prefetch filter
 #define PF_INVALID   0          // empty slot
@@ -62,7 +55,7 @@
 
 #define INITIAL_DEGREE 4
 #define MIN_DEGREE 1
-#define MAX_DEGREE 32
+#define MAX_DEGREE 16
 #define ACC_UP   60             // accuracy above 60%  -> degree + 1
 #define ACC_DOWN 40             // accuracy below 40%  -> degree - 1
                                 // in between          -> degree stays the same
@@ -71,8 +64,8 @@
 // ---------------- one row of the IP table ----------------
 class IP_TRACKER {
   public:
-    uint64_t ip;                // the IP this row tracks
-    uint64_t last_cl_addr;      // the last block this IP accessed
+    uint64_t ip;                // IP tag (IP_TAG_BITS)
+    uint64_t last_cl_addr;      // low LAST_ADDR_BITS of the last block this IP accessed
 
     // uniform detector: the stride we trust, and how much we trust it
     int64_t last_stride;
@@ -118,7 +111,7 @@ class SPP_PATTERN_ENTRY {
 IP_TRACKER trackers[IP_TRACKER_COUNT];
 SPP_PATTERN_ENTRY spp_pattern_table[PT_ENTRIES];
 
-// accuracy checker: recently prefetched blocks and their state
+// accuracy checker: recently prefetched blocks (partial tag) and their state
 uint64_t spp_pf_filter[PF_FILTER_SIZE];
 uint32_t spp_pf_filter_state[PF_FILTER_SIZE];
 
@@ -145,6 +138,15 @@ uint32_t spp_stats_reset_done = 0;
 // ============================================================================
 //  helper functions
 // ============================================================================
+
+// squeeze a stride into its 7-bit field: anything a page or more away
+// becomes STRIDE_FAR, which never yields an in-page prefetch
+int64_t spp_clamp_stride(int64_t stride)
+{
+    if (stride > STRIDE_MAX || stride < -STRIDE_MAX)
+        return STRIDE_FAR;
+    return stride;
+}
 
 // shared confidence rule, used by both detectors:
 //   same stride        -> confidence +1 (max CONF_MAX)
@@ -217,11 +219,16 @@ bool spp_predict(uint32_t sig, int64_t &stride)
     return false;
 }
 
+// the prefetch filter is direct mapped on the low block bits and keeps only a
+// PF_TAG_BITS partial tag of the bits above them
+uint32_t spp_pf_slot(uint64_t cl_addr) { return cl_addr & (PF_FILTER_SIZE - 1); }
+uint64_t spp_pf_tag(uint64_t cl_addr)  { return (cl_addr >> PF_FILTER_BITS) & PF_TAG_MASK; }
+
 // find a block in the prefetch filter; returns its slot, or -1 if it is not there
 int spp_find_pf_filter(uint64_t cl_addr)
 {
-    int slot = cl_addr & (PF_FILTER_SIZE - 1);
-    if (spp_pf_filter_state[slot] != PF_INVALID && spp_pf_filter[slot] == cl_addr)
+    int slot = spp_pf_slot(cl_addr);
+    if (spp_pf_filter_state[slot] != PF_INVALID && spp_pf_filter[slot] == spp_pf_tag(cl_addr))
         return slot;
     return -1;
 }
@@ -229,8 +236,8 @@ int spp_find_pf_filter(uint64_t cl_addr)
 // put a block in its filter slot with the given state (replaces whatever was there)
 void spp_add_pf_filter(uint64_t cl_addr, uint32_t state)
 {
-    int slot = cl_addr & (PF_FILTER_SIZE - 1);
-    spp_pf_filter[slot] = cl_addr;
+    int slot = spp_pf_slot(cl_addr);
+    spp_pf_filter[slot] = spp_pf_tag(cl_addr);
     spp_pf_filter_state[slot] = state;
 }
 
@@ -304,7 +311,7 @@ void CACHE::l1d_prefetcher_initialize()
     std::cout << "CPU " << cpu << " L1D Stride Pattern Prefetcher (SPP)" << std::endl;
 
     for (int i=0; i<IP_TRACKER_COUNT; i++)
-        trackers[i].lru = i;
+        trackers[i].lru = i % IP_WAYS;
 
     for (int i=0; i<PF_FILTER_SIZE; i++)
         spp_pf_filter_state[i] = PF_INVALID;
@@ -338,33 +345,42 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
     }
     spp_update_degree();
 
-    // ---------- find this IP's row (same as IP-stride) ----------
+    // ---------- find this IP's row ----------
+    // set-associative: the low bits of the IP tag pick a set of IP_WAYS rows,
+    // which is searched like IP-stride searches its whole table
     uint64_t ip_tag = ip & MASK_IP;
+    uint64_t short_addr = cl_addr & LAST_ADDR_MASK;
+    int base = (ip_tag % IP_SETS) * IP_WAYS;
 
     int index = -1;
-    for (index=0; index<IP_TRACKER_COUNT; index++) {
-        if (trackers[index].ip == ip_tag)
+    for (int w=0; w<IP_WAYS; w++) {
+        if (trackers[base + w].ip == ip_tag) {
+            index = base + w;
             break;
+        }
     }
 
     // this is a new IP that doesn't have a tracker yet, so allocate one
-    if (index == IP_TRACKER_COUNT) {
+    if (index == -1) {
 
-        for (index=0; index<IP_TRACKER_COUNT; index++) {
-            if (trackers[index].lru == (IP_TRACKER_COUNT-1))
+        for (int w=0; w<IP_WAYS; w++) {
+            if (trackers[base + w].lru == (IP_WAYS-1)) {
+                index = base + w;
                 break;
+            }
         }
+        assert(index != -1);
 
         trackers[index].ip = ip_tag;
-        trackers[index].last_cl_addr = cl_addr;
+        trackers[index].last_cl_addr = short_addr;
         trackers[index].last_stride = 0;
         trackers[index].confidence = 0;     // new IP: no trust yet
         trackers[index].signature = 0;      // new IP: no stride history yet
         trackers[index].num_strides = 0;
 
-        for (int i=0; i<IP_TRACKER_COUNT; i++) {
-            if (trackers[i].lru < trackers[index].lru)
-                trackers[i].lru++;
+        for (int w=0; w<IP_WAYS; w++) {
+            if (trackers[base + w].lru < trackers[index].lru)
+                trackers[base + w].lru++;
         }
         trackers[index].lru = 0;
 
@@ -372,31 +388,26 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
         return;
     }
 
-    if (index == -1)
-        assert(0);
-
     // mark this IP as most recently used now, before any early return, so
     // IPs that keep loading the same block are not evicted first
-    for (int i=0; i<IP_TRACKER_COUNT; i++) {
-        if (trackers[i].lru < trackers[index].lru)
-            trackers[i].lru++;
+    for (int w=0; w<IP_WAYS; w++) {
+        if (trackers[base + w].lru < trackers[index].lru)
+            trackers[base + w].lru++;
     }
     trackers[index].lru = 0;
 
-    // ---------- compute the stride (same as IP-stride) ----------
-    // addresses are unsigned, so a backward stride is computed the other way
-    // round and negated, instead of letting the subtraction wrap
-    int64_t stride = 0;
-    if (cl_addr > trackers[index].last_cl_addr)
-        stride = cl_addr - trackers[index].last_cl_addr;
-    else {
-        stride = trackers[index].last_cl_addr - cl_addr;
-        stride *= -1;
-    }
+    // ---------- compute the stride ----------
+    // subtract modulo 2^LAST_ADDR_BITS and sign-extend, so a backward stride
+    // comes out negative instead of wrapping to a huge number
+    int64_t stride = (int64_t)((short_addr - trackers[index].last_cl_addr) & LAST_ADDR_MASK);
+    if (stride >= (1LL << (LAST_ADDR_BITS - 1)))
+        stride -= (1LL << LAST_ADDR_BITS);
 
     // two accesses inside one block carry no information
     if (stride == 0)
         return;
+
+    stride = spp_clamp_stride(stride);
 
     // ---------- 1) train the uniform detector ----------
     spp_train(trackers[index].last_stride, trackers[index].confidence, stride, UNIFORM_MISS_PENALTY);
@@ -413,12 +424,15 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
     // ---------- 3) decide and prefetch ----------
     // a uniform run inside a repeating pattern (the +2,+2,+2 of +1,+2,+2,+2,+3)
     // looks confident, but the pattern table knows the next stride is different,
-    // so the pattern table is allowed to veto the uniform prediction
+    // so the pattern table is allowed to veto the uniform prediction.
+    // A confident STRIDE_FAR can never prefetch, so it does not count as a
+    // uniform prediction and the pattern table gets its chance instead.
     int64_t pt_stride = 0;
     bool pt_confident = (trackers[index].num_strides == SIG_LENGTH) && spp_predict(trackers[index].signature, pt_stride);
     bool pt_disagrees = pt_confident && (pt_stride != trackers[index].last_stride);
+    bool uniform_ok = (trackers[index].confidence >= CONF_THRESHOLD) && (trackers[index].last_stride != STRIDE_FAR);
 
-    if (trackers[index].confidence >= CONF_THRESHOLD && !pt_disagrees) {
+    if (uniform_ok && !pt_disagrees) {
 
         // UNIFORM: prefetch cl + s, cl + 2s, ... cl + degree*s
         for (uint32_t i=0; i<spp_degree; i++) {
@@ -450,7 +464,8 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
             pf_cl_addr = pf_cl_addr + next_stride;
             uint64_t pf_address = pf_cl_addr << LOG2_BLOCK_SIZE;
 
-            // only prefetch inside the same 4 KB page
+            // only prefetch inside the same 4 KB page (this also ends the
+            // chain on STRIDE_FAR)
             if ((pf_address >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE))
                 break;
 
@@ -461,7 +476,7 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
         }
     }
 
-    trackers[index].last_cl_addr = cl_addr;
+    trackers[index].last_cl_addr = short_addr;
     return;
 }
 
