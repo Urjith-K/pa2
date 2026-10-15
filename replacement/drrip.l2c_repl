@@ -1,0 +1,189 @@
+#include "cache.h"
+
+#include <cerrno>
+#include <cmath>
+#include <cstdlib>
+#include <limits>
+
+namespace {
+
+const uint32_t MAX_RRPV = 3;
+const uint32_t INSERT_RRPV = 2;
+
+enum Mode {
+    RRIP_MODE,
+    IRRIP_MODE
+};
+
+const double DEFAULT_THRESHOLD = 0.20;
+const char *THRESHOLD_ENV = "DRRIP_THRESHOLD";
+const char *LEGACY_THRESHOLD_ENV = "DRRIP_V2_THRESHOLD";
+
+uint32_t l2_rrpv[L2C_SET][L2C_WAY];
+double threshold = DEFAULT_THRESHOLD;
+uint64_t total_accesses = 0;
+uint64_t instruction_accesses = 0;
+uint64_t total_misses = 0;
+uint64_t instruction_misses = 0;
+
+bool is_instruction_line(uint8_t is_instruction, uint32_t type,
+                         const BLOCK *set, uint32_t way, bool hit)
+{
+    bool instruction_request = is_instruction &&
+                               (type == LOAD || type == PREFETCH);
+    return instruction_request || (hit && set[way].instruction);
+}
+
+void initialize_rrpv()
+{
+    for (uint32_t set = 0; set < L2C_SET; set++)
+        for (uint32_t way = 0; way < L2C_WAY; way++)
+            l2_rrpv[set][way] = MAX_RRPV;
+}
+
+uint32_t find_rrip_victim(uint32_t set, const BLOCK *current_set, Mode mode)
+{
+    assert(set < L2C_SET);
+
+    for (uint32_t way = 0; way < L2C_WAY; way++)
+        if (!current_set[way].valid)
+            return way;
+
+    while (true) {
+        for (uint32_t way = 0; way < L2C_WAY; way++) {
+            if (l2_rrpv[set][way] != MAX_RRPV)
+                continue;
+            if (mode == RRIP_MODE || !current_set[way].instruction)
+                return way;
+        }
+
+        if (mode == IRRIP_MODE) {
+            for (uint32_t way = 0; way < L2C_WAY; way++)
+                if (l2_rrpv[set][way] == MAX_RRPV)
+                    return way;
+        }
+
+        bool has_data = false;
+        if (mode == IRRIP_MODE) {
+            for (uint32_t way = 0; way < L2C_WAY; way++) {
+                if (current_set[way].valid && !current_set[way].instruction) {
+                    has_data = true;
+                    break;
+                }
+            }
+        }
+
+        for (uint32_t way = 0; way < L2C_WAY; way++) {
+            if (mode == IRRIP_MODE && has_data && current_set[way].instruction)
+                continue;
+            if (l2_rrpv[set][way] < MAX_RRPV)
+                l2_rrpv[set][way]++;
+        }
+    }
+}
+
+void update_rrpv(uint32_t set, uint32_t way, Mode mode,
+                 bool instruction_line, bool hit)
+{
+    assert(set < L2C_SET);
+    assert(way < L2C_WAY);
+
+    if (mode == RRIP_MODE) {
+        l2_rrpv[set][way] = hit ? 0 : INSERT_RRPV;
+        return;
+    }
+
+    if (!hit) {
+        l2_rrpv[set][way] = instruction_line ? 1 : INSERT_RRPV;
+        return;
+    }
+
+    l2_rrpv[set][way] = instruction_line ? 0 : 1;
+}
+
+void increment_saturating(uint64_t &counter)
+{
+    if (counter != std::numeric_limits<uint64_t>::max())
+        counter++;
+}
+
+void read_threshold()
+{
+    const char *value = std::getenv(THRESHOLD_ENV);
+    if (value == 0)
+        value = std::getenv(LEGACY_THRESHOLD_ENV);
+    threshold = DEFAULT_THRESHOLD;
+    if (value == 0)
+        return;
+
+    errno = 0;
+    char *end = 0;
+    double parsed = std::strtod(value, &end);
+    if (errno == ERANGE || end == value || *end != '\0' ||
+        !std::isfinite(parsed) || parsed < 0.0 || parsed > 1.0) {
+        std::cerr << "Invalid " << THRESHOLD_ENV << "/" << LEGACY_THRESHOLD_ENV
+                  << " value '" << value
+                  << "'; expected a number in [0, 1]." << std::endl;
+        std::exit(EXIT_FAILURE);
+    }
+    threshold = parsed;
+}
+
+bool select_irrip()
+{
+    long double numerator = static_cast<long double>(instruction_accesses) +
+                             static_cast<long double>(instruction_misses);
+    long double denominator = static_cast<long double>(total_accesses) +
+                               static_cast<long double>(total_misses);
+    return denominator > 0.0L && numerator / denominator > threshold;
+}
+
+}
+
+void CACHE::l2c_initialize_replacement()
+{
+    cout << "Initialize threshold dynamic I-RRIP for L2C" << endl;
+    read_threshold();
+    initialize_rrpv();
+    total_accesses = instruction_accesses = total_misses = instruction_misses = 0;
+    cout << "DRRIP threshold: " << threshold << endl;
+}
+
+uint32_t CACHE::l2c_find_victim(uint32_t, uint64_t, uint32_t set, const BLOCK *current_set, uint64_t, uint64_t, uint32_t)
+{
+    Mode mode = select_irrip() ? IRRIP_MODE : RRIP_MODE;
+    return find_rrip_victim(set, current_set, mode);
+}
+
+void CACHE::l2c_update_replacement_state(uint32_t, uint32_t set, uint32_t way, uint64_t, uint64_t, uint64_t, uint32_t type, uint8_t hit, uint8_t isInstruction)
+{
+    assert(set < L2C_SET);
+    assert(way < L2C_WAY);
+
+    bool instruction_line = is_instruction_line(isInstruction, type, block[set], way, hit != 0);
+    increment_saturating(total_accesses);
+    if (instruction_line)
+        increment_saturating(instruction_accesses);
+    if (!hit) {
+        increment_saturating(total_misses);
+        if (instruction_line)
+            increment_saturating(instruction_misses);
+    }
+
+    Mode mode = select_irrip() ? IRRIP_MODE : RRIP_MODE;
+    update_rrpv(set, way, mode, instruction_line, hit != 0);
+}
+
+void CACHE::l2c_replacement_final_stats()
+{
+    long double numerator = static_cast<long double>(instruction_accesses) +
+                            static_cast<long double>(instruction_misses);
+    long double denominator = static_cast<long double>(total_accesses) +
+                               static_cast<long double>(total_misses);
+    long double signal = denominator > 0.0L ? numerator / denominator : 0.0L;
+    cout << "DRRIP threshold: " << threshold << " signal: "
+         << static_cast<double>(signal) << " accesses/instruction-accesses/misses/instruction-misses: "
+         << total_accesses << "/" << instruction_accesses << "/"
+         << total_misses << "/" << instruction_misses << " selected: "
+         << (select_irrip() ? "I-RRIP" : "RRIP") << endl;
+}

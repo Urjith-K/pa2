@@ -1,0 +1,80 @@
+#include "cache.h"
+
+#define maxRRPV 3
+#define insertInstrRRPV 1
+#define insertDataRRPV 2
+#define promoteInstrRRPV 0
+#define promoteDataRRPV 1
+
+uint32_t l2_rrpv[L2C_SET][L2C_WAY];
+
+void CACHE::l2c_initialize_replacement()
+{
+    cout << "Initialize I-RRIP state for L2C" << endl;
+
+    for (uint32_t set = 0; set < L2C_SET; set++) {
+        for (uint32_t way = 0; way < L2C_WAY; way++) {
+            l2_rrpv[set][way] = maxRRPV;
+        }
+    }
+}
+
+uint32_t CACHE::l2c_find_victim(uint32_t, uint64_t, uint32_t set, const BLOCK *current_set, uint64_t, uint64_t, uint32_t)
+{
+    assert(set < L2C_SET);
+
+    for (uint32_t way = 0; way < L2C_WAY; way++) {
+        if (!current_set[way].valid)
+            return way;
+    }
+
+    while (true) {
+        for (uint32_t way = 0; way < L2C_WAY; way++) {
+            if (!current_set[way].instruction && l2_rrpv[set][way] == maxRRPV)
+                return way;
+        }
+
+        for (uint32_t way = 0; way < L2C_WAY; way++) {
+            if (current_set[way].instruction && l2_rrpv[set][way] == maxRRPV)
+                return way;
+        }
+
+        bool setHasData = false;
+        for (uint32_t way = 0; way < L2C_WAY; way++) {
+            if (current_set[way].valid && !current_set[way].instruction) {
+                setHasData = true;
+                break;
+            }
+        }
+
+        for (uint32_t way = 0; way < L2C_WAY; way++) {
+            if (setHasData && current_set[way].instruction)
+                continue;
+            if (l2_rrpv[set][way] < maxRRPV)
+                l2_rrpv[set][way]++;
+        }
+    }
+}
+
+void CACHE::l2c_update_replacement_state(uint32_t, uint32_t set, uint32_t way, uint64_t, uint64_t, uint64_t, uint32_t type, uint8_t hit, uint8_t isInstruction)
+{
+    assert(set < L2C_SET);
+    assert(way < L2C_WAY);
+
+    isInstruction = isInstruction && (type == LOAD || type == PREFETCH);
+
+    if (!hit) {
+        l2_rrpv[set][way] = isInstruction ? insertInstrRRPV : insertDataRRPV;
+        return;
+    }
+
+    isInstruction = isInstruction || block[set][way].instruction;
+    if (isInstruction)
+        block[set][way].instruction = 1;
+
+    l2_rrpv[set][way] = isInstruction ? promoteInstrRRPV : promoteDataRRPV;
+}
+
+void CACHE::l2c_replacement_final_stats()
+{
+}
