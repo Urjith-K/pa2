@@ -19,7 +19,13 @@ const double DEFAULT_THRESHOLD = 0.20;
 const char *THRESHOLD_ENV = "DRRIP_THRESHOLD";
 const char *LEGACY_THRESHOLD_ENV = "DRRIP_V2_THRESHOLD";
 
+// Task 3: prefetch awareness. Without a prefetcher no PREFETCH request reaches
+// the L2, so this path never triggers and Task 2B behaves exactly as before.
+#define PF_AWARE 1
+
 uint32_t l2_rrpv[L2C_SET][L2C_WAY];
+uint8_t pf_line[L2C_SET][L2C_WAY];  // filled by a prefetch and not demanded yet
+uint64_t pf_fills = 0, pf_demanded = 0, pf_evicted_unused = 0;
 double threshold = DEFAULT_THRESHOLD;
 uint64_t total_accesses = 0;
 uint64_t instruction_accesses = 0;
@@ -37,8 +43,10 @@ bool is_instruction_line(uint8_t is_instruction, uint32_t type,
 void initialize_rrpv()
 {
     for (uint32_t set = 0; set < L2C_SET; set++)
-        for (uint32_t way = 0; way < L2C_WAY; way++)
+        for (uint32_t way = 0; way < L2C_WAY; way++) {
             l2_rrpv[set][way] = MAX_RRPV;
+            pf_line[set][way] = 0;
+        }
 }
 
 uint32_t find_rrip_victim(uint32_t set, const BLOCK *current_set, Mode mode)
@@ -50,6 +58,16 @@ uint32_t find_rrip_victim(uint32_t set, const BLOCK *current_set, Mode mode)
             return way;
 
     while (true) {
+        // an unused prefetched line goes before any other line at MAX_RRPV
+        if (PF_AWARE) {
+            for (uint32_t way = 0; way < L2C_WAY; way++) {
+                if (pf_line[set][way] && l2_rrpv[set][way] == MAX_RRPV) {
+                    pf_evicted_unused++;
+                    return way;
+                }
+            }
+        }
+
         for (uint32_t way = 0; way < L2C_WAY; way++) {
             if (l2_rrpv[set][way] != MAX_RRPV)
                 continue;
@@ -160,6 +178,22 @@ void CACHE::l2c_update_replacement_state(uint32_t, uint32_t set, uint32_t way, u
     assert(set < L2C_SET);
     assert(way < L2C_WAY);
 
+    // data prefetch: insert at MAX_RRPV, never promote, and keep it out of the
+    // instruction-share counters so prefetch traffic cannot bias the mode choice
+    if (PF_AWARE && type == PREFETCH && !isInstruction) {
+        if (!hit) {
+            l2_rrpv[set][way] = MAX_RRPV;
+            pf_line[set][way] = 1;
+            pf_fills++;
+        }
+        return;
+    }
+    if (pf_line[set][way]) {
+        if (hit)
+            pf_demanded++;  // first demand use: from now on a normal line
+        pf_line[set][way] = 0;
+    }
+
     bool instruction_line = is_instruction_line(isInstruction, type, block[set], way, hit != 0);
     increment_saturating(total_accesses);
     if (instruction_line)
@@ -186,4 +220,8 @@ void CACHE::l2c_replacement_final_stats()
          << total_accesses << "/" << instruction_accesses << "/"
          << total_misses << "/" << instruction_misses << " selected: "
          << (select_irrip() ? "I-RRIP" : "RRIP") << endl;
+    if (PF_AWARE)
+        cout << "DRRIP prefetch-aware: prefetch fills: " << pf_fills
+             << " demanded later: " << pf_demanded
+             << " evicted unused: " << pf_evicted_unused << endl;
 }
